@@ -37,9 +37,12 @@ Native `extension-module` discovery comes from:
 
 - Project directory: `<cwd>/.omp/extensions`
 - User directory: the active agent directory's `extensions/` (default `~/.omp/agent/extensions`)
+- Shared user directory: `<home>/.omp/shared/extensions`, independent of the active profile or agent-directory override
 - Native legacy/settings JSON entries: `<cwd>/.omp/settings.json#extensions` and the active agent directory's `settings.json#extensions`
 
 The project root is the native provider's `.omp` directory (`SOURCE_PATHS.native.projectDir`), cwd-only; it does not walk ancestors. Native discovery uses its `LoadContext.agentDir` when supplied, otherwise `getAgentDir()`. With the default user config root, `omp --profile <name>` selects `~/.omp/profiles/<name>/agent/extensions`. `PI_CONFIG_DIR` changes that user config root; `PI_CODING_AGENT_DIR` overrides the agent directory only in the default profile, not named profiles. See [Profiles](./config-usage.md#profiles).
+
+Shared modules use the discovery context's `home`, not the active agent directory. They are additive: profile/project extension settings are not replaced, and profile-local modules remain isolated. A new profile discovers the same shared directory without copying configuration. Existing path deduplication prevents an explicitly configured shared entry from loading twice; normal disabled-extension and explicit-only discovery controls still apply.
 
 Notes:
 

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Shared user extensions in `~/.omp/shared/extensions` load by default in every profile, including new profiles, without replacing profile settings.
+
 ## [18.11.2] - 2026-10-16
 
 ### Added

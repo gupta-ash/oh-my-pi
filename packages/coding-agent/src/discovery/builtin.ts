@@ -512,9 +512,10 @@ async function loadExtensionModules(ctx: LoadContext): Promise<LoadResult<Extens
 
 	const configDirs = await getConfigDirs(ctx);
 
-	const [discoveredResults, settingsResults] = await Promise.all([
+	const [discoveredResults, settingsResults, sharedPaths] = await Promise.all([
 		Promise.all(configDirs.map(({ dir }) => discoverExtensionModulePaths(ctx, path.join(dir, "extensions")))),
 		Promise.all(configDirs.map(({ dir }) => readFile(path.join(dir, "settings.json")))),
+		discoverExtensionModulePaths(ctx, path.join(ctx.home, ".omp", "shared", "extensions")),
 	]);
 
 	for (let i = 0; i < configDirs.length; i++) {
@@ -522,6 +523,9 @@ async function loadExtensionModules(ctx: LoadContext): Promise<LoadResult<Extens
 		for (const extPath of discoveredResults[i]) {
 			items.push(createExtensionModule(extPath, level));
 		}
+	}
+	for (const extPath of sharedPaths) {
+		items.push(createExtensionModule(extPath, "user"));
 	}
 
 	const settingsExtensions: Array<{
