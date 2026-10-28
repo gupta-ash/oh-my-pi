@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Python eval now inherits the session shell environment, including refreshed variables when its kernel restarts.
+
 ## [18.13.2] - 2026-10-27
 
 ### Added

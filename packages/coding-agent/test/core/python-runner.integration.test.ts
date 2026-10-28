@@ -4,18 +4,23 @@
  * Gated by `PI_PYTHON_INTEGRATION=1` so CI without a real Python interpreter
  * (or sandboxes where subprocess spawning is restricted) does not fail.
  */
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import * as pythonProbe from "@oh-my-pi/pi-coding-agent/eval/probe";
 import {
 	disposeAllKernelSessions,
 	executePython,
 	executePythonWithKernel,
 } from "@oh-my-pi/pi-coding-agent/eval/py/executor";
-import { PythonKernel } from "@oh-my-pi/pi-coding-agent/eval/py/kernel";
+import { checkPythonKernelAvailability, PythonKernel } from "@oh-my-pi/pi-coding-agent/eval/py/kernel";
 import { filterEnv, resolvePythonRuntime } from "@oh-my-pi/pi-coding-agent/eval/py/runtime";
+import { setTuiTight } from "@oh-my-pi/pi-tui";
+import * as piUtils from "@oh-my-pi/pi-utils";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { __resetShellConfigCacheForTests, refreshShellConfigCache } from "@oh-my-pi/pi-utils/procmgr";
+import { beginSettingsTest, restoreEnvValue } from "../helpers/settings-test-state";
 
 const SHOULD_RUN = Bun.env.PI_PYTHON_INTEGRATION === "1";
 const MATPLOTLIB_TEST_CWD = process.cwd();
@@ -121,6 +126,115 @@ describe.skipIf(!SHOULD_RUN)("python runner subprocess", () => {
 	afterEach(async () => {
 		await disposeAllKernelSessions();
 	});
+
+	it("reuses cached Python selection but refreshes session env in a recreated kernel and its direct child", async () => {
+		using tempDir = TempDir.createSync("@python-runner-env-refresh-");
+		const settingsState = beginSettingsTest();
+		// Only synthetic session values change; availability-key variables stay stable.
+		const names = ["BRAVE_API_KEY", "TAVILY_API_KEY", "EXA_API_KEY", "SERPER_API_KEY"].flatMap(name => [
+			name,
+			`${name}_1`,
+			`${name}_2`,
+		]);
+		names.push("OMP_PYTHON_NONALLOWLISTED_DUMMY");
+		let kernel: PythonKernel | undefined;
+		try {
+			const inheritedPythonControls = { PYTHONUNBUFFERED: "0", PYTHONIOENCODING: "ascii" };
+			const initialEnv: Record<string, string> = {
+				...Object.fromEntries(names.map((name, index) => [name, `synthetic-session-one-${index}`])),
+				...inheritedPythonControls,
+			};
+			const refreshedEnv: Record<string, string | null> = {
+				...Object.fromEntries(
+					names.map((name, index) => [name, name.endsWith("_2") ? null : `synthetic-session-two-${index}`]),
+				),
+				...inheritedPythonControls,
+			};
+			for (const [name, value] of Object.entries(initialEnv)) restoreEnvValue(name, value);
+			restoreEnvValue("PI_PYTHON_SKIP_CHECK", undefined);
+			vi.spyOn(piUtils, "isBunTestRuntime").mockReturnValue(false);
+			// Count real probes without replacing probe, resolver, kernel, or child behavior.
+			const probeSpy = vi.spyOn(pythonProbe, "probeCandidates");
+			piUtils.setProjectDir(tempDir.path());
+			__resetShellConfigCacheForTests();
+			refreshShellConfigCache();
+			const settings = await Settings.init({
+				inMemory: true,
+				cwd: tempDir.path(),
+				agentDir: tempDir.join("agent"),
+			});
+			const interpreter = resolvePythonRuntime(tempDir.path(), settings.getShellConfig().env).pythonPath;
+			const availability = await checkPythonKernelAvailability(tempDir.path(), interpreter, { forceProbe: true });
+			expect(availability.ok).toBe(true);
+			expect(availability.pythonPath === interpreter).toBe(true);
+			expect((await checkPythonKernelAvailability(tempDir.path(), interpreter)) === availability).toBe(true);
+			expect(probeSpy.mock.calls.length).toBe(1);
+
+			const managedEnv = { EXA_API_KEY_1: "synthetic-managed-overlay" };
+			// Controls override inheritance without changing the later options.env init replay.
+			const pythonControls = { PYTHONUNBUFFERED: "1", PYTHONIOENCODING: "utf-8" };
+			const options = { cwd: tempDir.path(), interpreter, env: managedEnv };
+			const childSource = [
+				"import json, os, sys",
+				"expected = json.load(sys.stdin)",
+				"print(all(os.environ.get(key) == value for key, value in expected['env'].items()))",
+				"print(os.path.normcase(os.path.realpath(sys.executable)) == os.path.normcase(os.path.realpath(expected['python'])))",
+			].join("\n");
+			async function assertKernelAndChildEnvironment(
+				currentKernel: PythonKernel,
+				expectedEnv: Record<string, string | null>,
+			): Promise<void> {
+				const result = await executePythonWithKernel(
+					currentKernel,
+					[
+						"import json, os, subprocess, sys",
+						`__expected = json.loads(${JSON.stringify(JSON.stringify({ env: expectedEnv, python: interpreter }))})`,
+						"print(all(os.environ.get(key) == value for key, value in __expected['env'].items()))",
+						"print(os.path.normcase(os.path.realpath(sys.executable)) == os.path.normcase(os.path.realpath(__expected['python'])))",
+						`__child = subprocess.run([sys.executable, '-c', ${JSON.stringify(childSource)}], input=json.dumps(__expected), capture_output=True, text=True, timeout=5)`,
+						"print(__child.returncode == 0)",
+						"print(__child.stdout.strip() == 'True\\nTrue')",
+					].join("\n"),
+					{ timeoutMs: 10_000 },
+				);
+				// Keep inherited values out of diagnostics, including when a comparison fails.
+				expect(result.exitCode === 0).toBe(true);
+				expect(result.output.trim() === "True\nTrue\nTrue\nTrue").toBe(true);
+			}
+
+			kernel = await PythonKernel.start(options);
+			expect(kernel.pythonPath === availability.pythonPath).toBe(true);
+			expect(probeSpy.mock.calls.length).toBe(1);
+			await assertKernelAndChildEnvironment(kernel, { ...initialEnv, ...managedEnv, ...pythonControls });
+
+			for (const [name, value] of Object.entries(refreshedEnv)) restoreEnvValue(name, value ?? undefined);
+			refreshShellConfigCache();
+			// Existing processes retain their snapshot; only a newly started kernel refreshes it.
+			await assertKernelAndChildEnvironment(kernel, { ...initialEnv, ...managedEnv, ...pythonControls });
+			await kernel.shutdown();
+			kernel = undefined;
+
+			kernel = await PythonKernel.start(options);
+			expect(kernel.pythonPath === availability.pythonPath).toBe(true);
+			expect((await checkPythonKernelAvailability(tempDir.path(), interpreter)) === availability).toBe(true);
+			expect(probeSpy.mock.calls.length).toBe(1);
+			await assertKernelAndChildEnvironment(kernel, { ...refreshedEnv, ...managedEnv, ...pythonControls });
+		} finally {
+			try {
+				await kernel?.shutdown();
+			} finally {
+				vi.restoreAllMocks();
+				resetSettingsForTest();
+				for (const name of [...names, "PI_PYTHON_SKIP_CHECK", "PYTHONUNBUFFERED", "PYTHONIOENCODING"]) {
+					restoreEnvValue(name, settingsState.env[name]);
+				}
+				piUtils.setProjectDir(settingsState.projectDir);
+				setTuiTight(settingsState.tuiTight);
+				// No global agent/profile state changed; setAgentDir would clear inherited profiles.
+				__resetShellConfigCacheForTests();
+			}
+		}
+	}, 60_000);
 
 	it("does not replay a crashed cell's file write and accepts the next cell in a fresh kernel", async () => {
 		using tempDir = TempDir.createSync("@python-runner-crash-");

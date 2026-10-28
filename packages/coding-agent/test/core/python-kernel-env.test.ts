@@ -144,6 +144,49 @@ describe("enumeratePythonRuntimes", () => {
 		expect(runtime.env.PATH).toBe(`${binDir}${path.delimiter}${path.join(path.sep, "usr", "bin")}`);
 	});
 
+	it("retains a selected Conda layout without pyvenv.cfg while rebuilding activation from the current environment", () => {
+		const cwd = path.join(path.sep, "work");
+		const selectedVenvPath = path.join(cwd, "conda", "selected");
+		const relativeInterpreter = path.join(
+			"conda",
+			"selected",
+			...(process.platform === "win32" ? ["python.exe"] : ["bin", "python"]),
+		);
+		const pythonPath = path.join(cwd, relativeInterpreter);
+		const binDir = path.dirname(pythonPath);
+		const stalePath = path.join(path.sep, "old-session", "bin");
+		const freshPath = path.join(path.sep, "fresh-session", "bin");
+		const baseEnv: Record<string, string | undefined> = {
+			PATH: stalePath,
+			OPENAI_API_KEY: "old-secret",
+			PROJECT_VALUE: "old-value",
+			REMOVED_SESSION_VALUE: "old-only",
+		};
+		vi.spyOn(fs, "existsSync").mockReturnValue(false);
+
+		const previous = resolveExplicitPythonRuntime(relativeInterpreter, cwd, baseEnv, selectedVenvPath);
+		baseEnv.PATH = freshPath;
+		baseEnv.OPENAI_API_KEY = "fresh-secret";
+		baseEnv.PROJECT_VALUE = "fresh-value";
+		delete baseEnv.REMOVED_SESSION_VALUE;
+		const freshEnv = { ...baseEnv };
+
+		const runtime = resolveExplicitPythonRuntime(relativeInterpreter, cwd, baseEnv, selectedVenvPath);
+
+		expect(runtime.pythonPath).toBe(pythonPath);
+		expect(runtime.venvPath).toBe(selectedVenvPath);
+		expect(runtime.env.VIRTUAL_ENV).toBe(selectedVenvPath);
+		expect(runtime.env.PATH).toBe(`${binDir}${path.delimiter}${freshPath}`);
+		expect(runtime.env.OPENAI_API_KEY).toBe("fresh-secret");
+		expect(runtime.env.PROJECT_VALUE).toBe("fresh-value");
+		expect(Object.hasOwn(runtime.env, "REMOVED_SESSION_VALUE")).toBe(false);
+		expect(baseEnv).toEqual(freshEnv);
+		expect(Object.hasOwn(baseEnv, "VIRTUAL_ENV")).toBe(false);
+		expect(previous.env.PATH).toBe(`${binDir}${path.delimiter}${stalePath}`);
+		expect(previous.env.OPENAI_API_KEY).toBe("old-secret");
+		expect(previous.env.REMOVED_SESSION_VALUE).toBe("old-only");
+	});
+
 	it("expands a home-relative explicit interpreter instead of resolving against cwd", () => {
 		const home = path.join(path.sep, "home", "tester");
 		vi.spyOn(os, "homedir").mockReturnValue(home);
