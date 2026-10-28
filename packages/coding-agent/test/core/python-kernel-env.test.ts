@@ -128,6 +128,36 @@ describe("enumeratePythonRuntimes", () => {
 		expect(runtime.env.PATH).toBe(`${binDir}${path.delimiter}${path.join(path.sep, "usr", "bin")}`);
 	});
 
+	it("retains a selected Conda layout without pyvenv.cfg while rebuilding its PATH from the fresh environment", () => {
+		const cwd = path.join(path.sep, "work");
+		const selectedVenvPath = path.join(cwd, "conda", "selected");
+		const relativeInterpreter = path.join(
+			"conda",
+			"selected",
+			...(process.platform === "win32" ? ["python.exe"] : ["bin", "python"]),
+		);
+		const pythonPath = path.join(cwd, relativeInterpreter);
+		const binDir = path.dirname(pythonPath);
+		const freshPath = path.join(path.sep, "fresh-session", "bin");
+		const baseEnv = { PATH: freshPath };
+		vi.spyOn(fs, "existsSync").mockReturnValue(false);
+
+		const runtime = resolveExplicitPythonRuntime(relativeInterpreter, cwd, baseEnv, selectedVenvPath);
+
+		expect(runtime.pythonPath).toBe(pythonPath);
+		expect(runtime.venvPath).toBe(selectedVenvPath);
+		expect(runtime.env.VIRTUAL_ENV).toBe(selectedVenvPath);
+		expect(runtime.env.PATH).toBe(`${binDir}${path.delimiter}${freshPath}`);
+		expect(baseEnv.PATH).toBe(freshPath);
+		expect(Object.hasOwn(baseEnv, "VIRTUAL_ENV")).toBe(false);
+
+		// Without cached selection facts, the existing pyvenv.cfg detection still applies.
+		const unselected = resolveExplicitPythonRuntime(relativeInterpreter, cwd, baseEnv);
+		expect(unselected.venvPath).toBeUndefined();
+		expect(unselected.env.VIRTUAL_ENV).toBeUndefined();
+		expect(unselected.env.PATH).toBe(freshPath);
+	});
+
 	it("expands a home-relative explicit interpreter instead of resolving against cwd", () => {
 		const home = path.join(path.sep, "home", "tester");
 		vi.spyOn(os, "homedir").mockReturnValue(home);

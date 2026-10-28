@@ -454,9 +454,9 @@ Small typed decisions the app makes about its own state (the `auto` thinking-lev
 | `VIRTUAL_ENV`          | Highest-priority venv path for Python runtime resolution                                            |
 | `CONDA_PREFIX`         | Python environment fallback after `VIRTUAL_ENV`, before local `.venv` / `venv` directories          |
 
-Python subprocess filtering denies common API keys and allows safe base variables plus `LC_`, `XDG_`, and `PI_` prefixes.
+IDA's separate Python worker filtering denies common API keys and allows safe base variables plus `LC_`, `XDG_`, and `PI_` prefixes. Python Eval kernels instead inherit the current session `Settings.getShellConfig().env` snapshot.
 
-Shell subprocess filtering is separate (`packages/utils/src/env.ts`): it strips project-dotenv values rather than applying Python's key allowlist.
+Shell subprocess filtering is separate (`packages/utils/src/env.ts`): it strips project-dotenv values rather than applying IDA's Python-worker allowlist.
 
 ---
 
@@ -704,4 +704,4 @@ Treat these as secrets; do not log or commit them:
 - Foundry mTLS material (`CLAUDE_CODE_CLIENT_CERT`, `CLAUDE_CODE_CLIENT_KEY`, `NODE_EXTRA_CA_CERTS` when it points to private CA bundles)
 - OTLP exporter headers (`OTEL_EXPORTER_OTLP_HEADERS` and the per-signal `..._{TRACES,LOGS,METRICS}_HEADERS` variants) — they carry ingest bearer tokens/project keys
 
-Python runtime also explicitly strips many common key vars before spawning kernel subprocesses (`packages/coding-agent/src/eval/py/runtime.ts`).
+Fresh/reset Python Eval kernels inherit the same session shell-environment snapshot as Bash, including session credentials, with the existing Git-location and launch-project dotenv isolation and managed Eval overlays. A running kernel does not hot-sync later host changes; see [Python runtime environment](python-repl.md). IDA's separate Python worker filtering is unchanged.

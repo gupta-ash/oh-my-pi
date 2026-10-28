@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed fresh and reset Python Eval kernels missing session-injected environment variables or retaining stale values after a supported session environment refresh.
+
 ## [18.12.6] - 2026-10-21
 
 ### Added

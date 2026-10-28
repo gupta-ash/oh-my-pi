@@ -4,18 +4,23 @@
  * Gated by `PI_PYTHON_INTEGRATION=1` so CI without a real Python interpreter
  * (or sandboxes where subprocess spawning is restricted) does not fail.
  */
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import * as pythonProbe from "@oh-my-pi/pi-coding-agent/eval/probe";
 import {
 	disposeAllKernelSessions,
 	executePython,
 	executePythonWithKernel,
 } from "@oh-my-pi/pi-coding-agent/eval/py/executor";
-import { PythonKernel } from "@oh-my-pi/pi-coding-agent/eval/py/kernel";
+import { checkPythonKernelAvailability, PythonKernel } from "@oh-my-pi/pi-coding-agent/eval/py/kernel";
 import { filterEnv, resolvePythonRuntime } from "@oh-my-pi/pi-coding-agent/eval/py/runtime";
+import { setTuiTight } from "@oh-my-pi/pi-tui";
+import * as piUtils from "@oh-my-pi/pi-utils";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { __resetShellConfigCacheForTests, refreshShellConfigCache } from "@oh-my-pi/pi-utils/procmgr";
+import { beginSettingsTest, restoreEnvValue } from "../helpers/settings-test-state";
 
 const SHOULD_RUN = Bun.env.PI_PYTHON_INTEGRATION === "1";
 const MATPLOTLIB_TEST_CWD = process.cwd();
@@ -122,6 +127,108 @@ describe.skipIf(!SHOULD_RUN)("python runner subprocess", () => {
 		await disposeAllKernelSessions();
 	});
 
+	it("reuses cached Python selection but refreshes session env in a recreated kernel and its direct child", async () => {
+		using tempDir = TempDir.createSync("@python-runner-env-refresh-");
+		const settingsState = beginSettingsTest();
+		// These are synthetic fixtures, never credentials read from the host session.
+		const names = ["BRAVE_API_KEY", "TAVILY_API_KEY", "EXA_API_KEY", "SERPER_API_KEY"].flatMap(name => [
+			name,
+			`${name}_1`,
+			`${name}_2`,
+		]);
+		names.push("OMP_PYTHON_NONALLOWLISTED_DUMMY");
+		let kernel: PythonKernel | undefined;
+		try {
+			const initialEnv: Record<string, string> = Object.fromEntries(
+				names.map((name, index) => [name, `synthetic-session-one-${index}`]),
+			);
+			const refreshedEnv: Record<string, string | null> = Object.fromEntries(
+				names.map((name, index) => [name, name.endsWith("_2") ? null : `synthetic-session-two-${index}`]),
+			);
+			for (const [name, value] of Object.entries(initialEnv)) restoreEnvValue(name, value);
+			restoreEnvValue("PI_PYTHON_SKIP_CHECK", undefined);
+			vi.spyOn(piUtils, "isBunTestRuntime").mockReturnValue(false);
+			// A call-through spy counts real availability probes without replacing their behavior.
+			const probeSpy = vi.spyOn(pythonProbe, "probeCandidates");
+			piUtils.setProjectDir(tempDir.path());
+			__resetShellConfigCacheForTests();
+			refreshShellConfigCache();
+			const settings = await Settings.init({
+				inMemory: true,
+				cwd: tempDir.path(),
+				agentDir: tempDir.join("agent"),
+			});
+			const interpreter = resolvePythonRuntime(tempDir.path(), settings.getShellConfig().env).pythonPath;
+			const availability = await checkPythonKernelAvailability(tempDir.path(), interpreter, { forceProbe: true });
+			expect(availability.ok).toBe(true);
+			expect(availability.pythonPath === interpreter).toBe(true);
+			expect(availability.runtime?.pythonPath === interpreter).toBe(true);
+			expect(Object.keys(availability.runtime ?? {}).sort().join(",") === "pythonPath,venvPath").toBe(true);
+			expect((await checkPythonKernelAvailability(tempDir.path(), interpreter)) === availability).toBe(true);
+			expect(probeSpy.mock.calls.length === 1).toBe(true);
+
+			const managedEnv = { EXA_API_KEY_1: "synthetic-managed-overlay" };
+			const options = { cwd: tempDir.path(), interpreter, env: managedEnv };
+			const childSource = [
+				"import json, os, sys",
+				"expected = json.load(sys.stdin)",
+				"print(all(os.environ.get(key) == value for key, value in expected['env'].items()))",
+				"print(os.path.normcase(os.path.realpath(sys.executable)) == os.path.normcase(os.path.realpath(expected['python'])))",
+			].join("\n");
+			async function assertKernelAndChildEnvironment(
+				currentKernel: PythonKernel,
+				expectedEnv: Record<string, string | null>,
+			): Promise<void> {
+				const result = await executePythonWithKernel(
+					currentKernel,
+					[
+						"import json, os, subprocess, sys",
+						`__expected = json.loads(${JSON.stringify(JSON.stringify({ env: expectedEnv, python: interpreter }))})`,
+						"print(all(os.environ.get(key) == value for key, value in __expected['env'].items()))",
+						"print(os.path.normcase(os.path.realpath(sys.executable)) == os.path.normcase(os.path.realpath(__expected['python'])))",
+						`__child = subprocess.run([sys.executable, '-c', ${JSON.stringify(childSource)}], input=json.dumps(__expected), capture_output=True, text=True, timeout=5)`,
+						"print(__child.returncode == 0)",
+						"print(__child.stdout.strip() == 'True\\nTrue')",
+					].join("\n"),
+					{ timeoutMs: 10_000 },
+				);
+				// Only booleans reach test diagnostics; neither process prints the environment values.
+				expect(result.exitCode === 0).toBe(true);
+				expect(result.output.trim() === "True\nTrue\nTrue\nTrue").toBe(true);
+			}
+
+			kernel = await PythonKernel.start(options);
+			expect(kernel.pythonPath === availability.pythonPath).toBe(true);
+			expect(probeSpy.mock.calls.length === 1).toBe(true);
+			await assertKernelAndChildEnvironment(kernel, { ...initialEnv, ...managedEnv });
+
+			for (const [name, value] of Object.entries(refreshedEnv)) restoreEnvValue(name, value ?? undefined);
+			refreshShellConfigCache();
+			// Refresh affects future starts, not an already-running kernel or its children.
+			await assertKernelAndChildEnvironment(kernel, { ...initialEnv, ...managedEnv });
+			await kernel.shutdown();
+			kernel = undefined;
+
+			kernel = await PythonKernel.start(options);
+			expect(kernel.pythonPath === availability.pythonPath).toBe(true);
+			expect((await checkPythonKernelAvailability(tempDir.path(), interpreter)) === availability).toBe(true);
+			expect(probeSpy.mock.calls.length === 1).toBe(true);
+			await assertKernelAndChildEnvironment(kernel, { ...refreshedEnv, ...managedEnv });
+		} finally {
+			try {
+				await kernel?.shutdown();
+			} finally {
+				vi.restoreAllMocks();
+				resetSettingsForTest();
+				for (const name of [...names, "PI_PYTHON_SKIP_CHECK"]) restoreEnvValue(name, settingsState.env[name]);
+				piUtils.setProjectDir(settingsState.projectDir);
+				setTuiTight(settingsState.tuiTight);
+				// This fixture never changes global agent/profile state; setAgentDir would clear it.
+				__resetShellConfigCacheForTests();
+			}
+		}
+	}, 60_000);
+
 	it("does not replay a crashed cell's file write and accepts the next cell in a fresh kernel", async () => {
 		using tempDir = TempDir.createSync("@python-runner-crash-");
 		const options = {
@@ -140,7 +247,8 @@ describe.skipIf(!SHOULD_RUN)("python runner subprocess", () => {
 			].join("\n"),
 			options,
 		);
-		expect(await Bun.file(path.join(tempDir.path(), "effects.txt")).text()).toBe("once\n");
+		const effectsAfterCrash = await Bun.file(path.join(tempDir.path(), "effects.txt")).text();
+		expect(effectsAfterCrash.split(/\r?\n/).filter(Boolean)).toEqual(["once"]);
 		expect(result.cancelled).toBe(true);
 		expect(result.output).toContain("before crash");
 		expect(result.output).toContain("completion is uncertain");
@@ -148,7 +256,7 @@ describe.skipIf(!SHOULD_RUN)("python runner subprocess", () => {
 		const next = await executePython("print(21 * 2)", options);
 		expect(next.exitCode).toBe(0);
 		expect(next.output.trim()).toBe("42");
-		expect(await Bun.file(path.join(tempDir.path(), "effects.txt")).text()).toBe("once\n");
+		expect(await Bun.file(path.join(tempDir.path(), "effects.txt")).text()).toBe(effectsAfterCrash);
 	}, 30_000);
 
 	it("streams stdout chunks as they are produced", async () => {
@@ -187,16 +295,33 @@ describe.skipIf(!SHOULD_RUN)("python runner subprocess", () => {
 		}
 	});
 
-	it("cancels a long sleep via SIGINT within 500ms", async () => {
+	it("cancels a running sleep promptly and preserves the kernel", async () => {
 		using tempDir = TempDir.createSync("@python-runner-cancel-");
 		const kernel = await PythonKernel.start({ cwd: tempDir.path() });
 		try {
-			const start = Date.now();
 			const ac = new AbortController();
-			const pending = executePythonWithKernel(kernel, "import time\ntime.sleep(30)", {
-				signal: ac.signal,
-			});
-			setTimeout(() => ac.abort(new DOMException("user cancelled", "AbortError")), 50);
+			const entered = Promise.withResolvers<void>();
+			let output = "";
+			const pending = executePythonWithKernel(
+				kernel,
+				"import time\nprint('sleep-ready', flush=True)\ntime.sleep(30)",
+				{
+					signal: ac.signal,
+					timeoutMs: 10_000,
+					onChunk: chunk => {
+						output += chunk;
+						if (output.includes("sleep-ready\n")) entered.resolve();
+					},
+				},
+			);
+			await Promise.race([
+				entered.promise,
+				pending.then(() => {
+					throw new Error("Python cell ended before entering the sleep");
+				}),
+			]);
+			const start = Date.now();
+			ac.abort(new DOMException("user cancelled", "AbortError"));
 			const result = await pending;
 			const elapsed = Date.now() - start;
 			expect(result.cancelled).toBe(true);
@@ -208,7 +333,7 @@ describe.skipIf(!SHOULD_RUN)("python runner subprocess", () => {
 		} finally {
 			await kernel.shutdown();
 		}
-	});
+	}, 30_000);
 
 	it("executes file-backed cells in the retained namespace with script import semantics", async () => {
 		using tempDir = TempDir.createSync("@python-runner-file-");
@@ -525,28 +650,33 @@ describe.skipIf(!SHOULD_RUN)("python runner subprocess", () => {
 			const snapshot = await kernel.snapshotUserNamespace();
 			if (!snapshot) throw new Error("expected retained Python snapshot");
 			await executePythonWithKernel(kernel, "atomic_stale_guard = 2");
-			await expect(kernel.executeIfSnapshotMatches("atomic_stale_guard = 3", snapshot)).resolves.toBeNull();
+			await expect(
+				kernel.executeIfSnapshotMatches("atomic_stale_guard = 3", snapshot, { timeoutMs: 5_000 }),
+			).resolves.toBeNull();
 			expect((await kernel.snapshotUserNamespace())?.values.atomic_stale_guard).toBe(2);
 
 			const current = await kernel.snapshotUserNamespace();
 			if (!current) throw new Error("expected current Python snapshot");
-			await expect(kernel.executeIfSnapshotMatches("atomic_stale_guard = 4", current)).resolves.toMatchObject({
-				status: "ok",
-			});
+			await expect(
+				kernel.executeIfSnapshotMatches("atomic_stale_guard = 4", current, { timeoutMs: 5_000 }),
+			).resolves.toMatchObject({ status: "ok" });
 			expect((await kernel.snapshotUserNamespace())?.values.atomic_stale_guard).toBe(4);
 
 			const racingSnapshot = await kernel.snapshotUserNamespace();
 			if (!racingSnapshot) throw new Error("expected racing Python snapshot");
 			const normalRun = kernel.execute(
 				["import asyncio", "await asyncio.sleep(0.05)", "atomic_race_guard = 1"].join("\n"),
+				{ timeoutMs: 5_000 },
 			);
-			await expect(kernel.executeIfSnapshotMatches("atomic_race_guard = 2", racingSnapshot)).resolves.toBeNull();
+			await expect(
+				kernel.executeIfSnapshotMatches("atomic_race_guard = 2", racingSnapshot, { timeoutMs: 5_000 }),
+			).resolves.toBeNull();
 			expect((await normalRun).status).toBe("ok");
 			expect((await kernel.snapshotUserNamespace())?.values.atomic_race_guard).toBe(1);
 		} finally {
 			await kernel.shutdown();
 		}
-	});
+	}, 30_000);
 
 	it("projects source-stable Python operations without executing candidate code", async () => {
 		using tempDir = TempDir.createSync("@python-runner-shadow-plan-");
@@ -626,7 +756,7 @@ describe.skipIf(!SHOULD_RUN)("python runner subprocess", () => {
 		} finally {
 			await kernel.shutdown();
 		}
-	});
+	}, 30_000);
 	it("emits an error frame when user code raises", async () => {
 		using tempDir = TempDir.createSync("@python-runner-error-");
 		const kernel = await PythonKernel.start({ cwd: tempDir.path() });

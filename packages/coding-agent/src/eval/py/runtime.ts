@@ -119,7 +119,7 @@ function resolveManagedPythonCandidate(): { venvPath: string; pythonPath: string
 export interface PythonRuntime {
 	/** Path to python executable */
 	pythonPath: string;
-	/** Filtered environment variables */
+	/** Environment used to launch the selected interpreter. */
 	env: Record<string, string | undefined>;
 	/** Path to virtual environment, if detected */
 	venvPath?: string;
@@ -196,14 +196,16 @@ function detectExplicitVenv(pythonPath: string): { venvPath: string; binDir: str
  * Resolve an explicitly configured interpreter (`python.interpreter`) into a
  * runtime, bypassing discovery. Does not probe or validate the executable —
  * callers must check it actually runs. `~` expands to the home directory and
- * relative paths resolve against `cwd`. When the interpreter sits inside a
- * virtualenv (a `pyvenv.cfg` above its bin dir), the venv activation env is
- * applied so subprocesses and `pip` resolve consistently.
+ * relative paths resolve against `cwd`. An already selected venv is preserved
+ * even without `pyvenv.cfg`; otherwise a virtualenv above the interpreter's bin
+ * directory is detected. Its activation env is applied to the current base env
+ * so subprocesses and `pip` resolve consistently.
  */
 export function resolveExplicitPythonRuntime(
 	interpreter: string,
 	cwd: string,
 	baseEnv: Record<string, string | undefined>,
+	selectedVenvPath?: string,
 ): PythonRuntime {
 	const expanded =
 		interpreter === "~"
@@ -219,7 +221,10 @@ export function resolveExplicitPythonRuntime(
 		: path.isAbsolute(cwd)
 			? path.join(cwd, expanded)
 			: path.resolve(cwd, expanded);
-	const venv = detectExplicitVenv(pythonPath);
+	const venv =
+		selectedVenvPath !== undefined
+			? { venvPath: selectedVenvPath, binDir: path.dirname(pythonPath) }
+			: detectExplicitVenv(pythonPath);
 	if (venv) {
 		return { pythonPath, env: applyVenvEnv(baseEnv, venv.venvPath, venv.binDir), venvPath: venv.venvPath };
 	}

@@ -24,7 +24,6 @@ import { PYTHON_PRELUDE } from "./prelude";
 import RUNNER_SCRIPT from "./runner.py" with { type: "text" };
 import {
 	enumeratePythonRuntimes,
-	filterEnv,
 	type PythonRuntime,
 	resolveExplicitPythonRuntime,
 	resolvePythonRuntime,
@@ -80,8 +79,8 @@ export interface PythonKernelAvailability {
 	ok: boolean;
 	pythonPath?: string;
 	reason?: string;
-	/** The probed-working runtime, when one was found. */
-	runtime?: PythonRuntime;
+	/** Probed interpreter/venv facts only; each kernel rebuilds its environment. */
+	runtime?: Pick<PythonRuntime, "pythonPath" | "venvPath">;
 }
 
 export interface PythonPreludeSource {
@@ -137,11 +136,10 @@ async function probePythonKernelAvailability(
 ): Promise<PythonKernelAvailability> {
 	try {
 		const settings = await Settings.init();
-		const { env } = settings.getShellConfig();
-		const baseEnv = filterEnv(env);
+		const { env: shellEnv } = settings.getShellConfig();
 		const runtimes = interpreter
-			? [resolveExplicitPythonRuntime(interpreter, cwd, baseEnv)]
-			: enumeratePythonRuntimes(cwd, baseEnv);
+			? [resolveExplicitPythonRuntime(interpreter, cwd, shellEnv)]
+			: enumeratePythonRuntimes(cwd, shellEnv);
 		if (runtimes.length === 0) {
 			return { ok: false, reason: "Python executable not found on PATH" };
 		}
@@ -155,7 +153,11 @@ async function probePythonKernelAvailability(
 		);
 		if (result.ok) {
 			const runtime = runtimes[result.index];
-			return { ok: true, pythonPath: runtime.pythonPath, runtime };
+			return {
+				ok: true,
+				pythonPath: runtime.pythonPath,
+				runtime: { pythonPath: runtime.pythonPath, venvPath: runtime.venvPath },
+			};
 		}
 		if (result.aborted) {
 			return { ok: false, pythonPath: runtimes[0].pythonPath, reason: "Python availability probe was cancelled." };
@@ -285,13 +287,17 @@ export class PythonKernel extends BaseKernel<PythonKernelExecuteOptions> {
 			throw new Error(availability.reason ?? "Python kernel unavailable");
 		}
 
-		let runtime = availability.runtime;
-		if (!runtime) {
-			const { env: shellEnv } = (await Settings.init()).getShellConfig();
-			runtime = options.interpreter
-				? resolveExplicitPythonRuntime(options.interpreter, options.cwd, filterEnv(shellEnv))
-				: resolvePythonRuntime(options.cwd, filterEnv(shellEnv));
-		}
+		const { env: shellEnv } = (await Settings.init()).getShellConfig();
+		const runtime = availability.runtime
+			? resolveExplicitPythonRuntime(
+					availability.runtime.pythonPath,
+					options.cwd,
+					shellEnv,
+					availability.runtime.venvPath,
+				)
+			: options.interpreter
+				? resolveExplicitPythonRuntime(options.interpreter, options.cwd, shellEnv)
+				: resolvePythonRuntime(options.cwd, shellEnv);
 		const spawnEnv: Record<string, string> = {};
 		for (const [key, value] of Object.entries(runtime.env)) {
 			if (typeof value === "string") spawnEnv[key] = value;
