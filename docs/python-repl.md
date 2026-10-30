@@ -17,7 +17,7 @@ It covers tool behavior, runner lifecycle, environment handling, execution seman
 - Tool output renderer and view splitting: `packages/tui/src/tools/eval.ts`
 - Shared output capture: `packages/tui/src/tools/streaming-output.ts`
 - Interactive-mode renderer for user-triggered Python runs: `packages/tui/src/chat/eval-execution.ts`
-- Runtime/env filtering and Python resolution: `src/eval/py/runtime.ts`
+- Runtime environment and Python resolution: `src/eval/py/runtime.ts` (also retains `filterEnv` for IDA)
 
 ## What eval's Python backend is
 
@@ -44,7 +44,7 @@ Each Python kernel is a single subprocess: `<resolved-python> -u <runner.py>`. T
 Kernel startup sequence:
 
 1. Availability check (`checkPythonKernelAvailability`) — verifies that a Python interpreter resolves and runs.
-2. Spawn `python -u runner.py` with filtered env and `cwd`.
+2. Reconstruct the selected runtime from the current session shell environment, apply managed spawn overlays, and spawn `python -u runner.py` with `cwd`.
 3. Send an init request that runs `os.chdir(cwd)`, injects env entries, and adds `cwd` to `sys.path`.
 4. Execute `PYTHON_PRELUDE` (idempotent — only initializes once per process).
 
@@ -135,13 +135,13 @@ The host reapplies the session cwd before each cell and puts it first on `sys.pa
 
 Cells support top-level `await`, `async for`, and `async with` on a persistent asyncio event loop. Use top-level `await` rather than `asyncio.run()`, which cannot start a second loop in that thread. The last non-`None` expression is echoed like printing its `repr`, with the same images and views as `print`.
 
-## Environment filtering and runtime resolution
+## Environment inheritance and runtime resolution
 
-Environment is filtered before launching the runner:
+The availability probe and every new Python kernel use the existing `Settings.getShellConfig().env` session snapshot, the same inherited environment supplied to Bash child processes. Python Eval does not apply the API-key allowlist/denylist in `filterEnv`: session credentials and other inherited variables are intentionally available, not just a provider-specific exception list. Existing launch-project dotenv and Git-location isolation in the child-shell environment remain in force.
 
-- Allowlist includes core vars like `PATH`, `HOME`, locale vars, `VIRTUAL_ENV`, `PYTHONPATH`, etc.
-- Allow-prefixes: `LC_`, `XDG_`, `PI_`
-- Denylist strips common API keys (OpenAI/Anthropic/Gemini/etc.)
+After the main agent's `session_start`, `session_switch`, and `session_branch` handlers inject session environment, the existing `refreshShellConfigCache()` lifecycle captures that environment for subsequent child processes. A new or reset kernel reads this refreshed snapshot. An already-running retained kernel does not automatically resynchronize arbitrary host environment changes; its existing environment and in-kernel mutations persist. Shell-local exports, rc files, and direnv effects are not imported back into the host snapshot, and this path adds no registry lookup or secret-copy bridge.
+
+`filterEnv` remains unchanged for IDA's separate Python runtime. JavaScript Eval is outside this Python inheritance change.
 
 Runtime selection order (skipped entirely when the `python.interpreter` setting names an explicit executable):
 
@@ -149,11 +149,11 @@ Runtime selection order (skipped entirely when the `python.interpreter` setting 
 2. Managed venv at `~/.omp/python-env`
 3. `python` or `python3` on PATH
 
-Candidates are probed in order until one runs; a broken venv does not automatically shadow a working later candidate. The selected working runtime is cached for that cwd/interpreter key. An explicit interpreter is a path (with `~` expansion and relative paths resolved against session cwd), not a PATH-search command name.
+Candidates are probed in order until one runs; a broken venv does not automatically shadow a working later candidate. Successful availability caches only `pythonPath` and optional `venvPath` runtime facts, never an environment map, for the existing cwd/interpreter/environment-sensitive key. Every new kernel reconstructs the selected runtime against the current shell snapshot, so changed values and removals are not replayed from the probe. An explicit interpreter is a path (with `~` expansion and relative paths resolved against session cwd), not a PATH-search command name.
 
-When a venv is selected, its bin/Scripts path is prepended to `PATH`. The managed venv path follows the configured OMP data root; `~/.omp/python-env` is the default.
+When a venv is selected, reconstruction preserves that selection even for Conda or managed layouts without `pyvenv.cfg`. Its bin directory is derived from the resolved interpreter and prepended to the current snapshot's `PATH`, and `VIRTUAL_ENV` is set on a copy of that snapshot. Without an already selected venv, explicit-interpreter venv detection is unchanged. The managed venv path follows the configured OMP data root; `~/.omp/python-env` is the default.
 
-The runner additionally receives `PYTHONUNBUFFERED=1` and `PYTHONIOENCODING=utf-8` so streamed output reaches the host promptly.
+At spawn, the reconstructed runtime environment is overlaid with managed `options.env`, then `PYTHONUNBUFFERED=1` and `PYTHONIOENCODING=utf-8` are set so streamed output reaches the host promptly. The existing init request subsequently reapplies `options.env`; this does not change that overlay order.
 
 Session/bridge context is patched before each cell through `PI_SESSION_FILE`, `PI_ARTIFACTS_DIR`, `PI_TOOL_BRIDGE_URL`, `PI_TOOL_BRIDGE_TOKEN`, `PI_TOOL_BRIDGE_SESSION`, and `PI_EVAL_LOCAL_ROOTS`. Missing managed entries are removed from `os.environ`; unrelated environment mutations remain.
 
